@@ -1,8 +1,57 @@
 #!/bin/bash
+set -eu
+
+pipedirguessed=0
+if [[ "${HCPPIPEDIR:-}" == "" ]]
+then
+    pipedirguessed=1
+    export HCPPIPEDIR="$(dirname -- "$0")/../.."
+fi
+
+source "$HCPPIPEDIR/global/scripts/newopts.shlib" "$@"
+source "$HCPPIPEDIR/global/scripts/debug.shlib" "$@"
+
+#this function gets called by opts_ParseArguments when --help is specified
+function usage()
+{
+    #header text
+    echo "
+$log_ToolName: makes QC scenes and captures for HCP FreeSurfer pipelines
+
+Usage: $log_ToolName PARAMETER...
+
+PARAMETERs are [ ] = optional; < > = user supplied value
+"
+    #automatic argument descriptions
+    opts_ShowArguments
+    
+    #do not use exit, the parsing code takes care of it
+}
+
+#arguments to opts_Add*: switch, variable to set, name for inside of <> in help text, description, [default value if AddOptional], [compatibility flag, ...]
+#help info for option gets printed like "--foo=<$3> - $4"
+opts_AddMandatory '--study-folder' 'StudyFolder' 'path' "folder containing all subjects"
+opts_AddMandatory '--subject' 'Subject' 'subject ID' ""
+opts_AddMandatory '--output-folder' 'OutputSceneFolder' 'path' "output location for QC scene, etc"
+
+opts_AddOptional '--copy-templates' 'TemplatesMethod' 'no|links|files' "how to add the template files to the output directory, default 'files'" 'files'
+opts_AddOptional '--verbose' 'verboseArg' 'true|false' "whether to output more messages, default 'false'" 'false'
+
+opts_ParseArguments "$@"
+
+if ((pipedirguessed))
+then
+    log_Err_Abort "HCPPIPEDIR is not set, you must first source your edited copy of Examples/Scripts/SetUpHCPPipeline.sh"
+fi
+
+#display the parsed/default values
+opts_ShowValues
+
+#processing code goes here
 
 ## Generating Workbench Scenes for Structural Quality Control
 ##
-## Authors: Michael Harms, Michael Hodge, and Donna Dierker
+## Authors: Michael Harms, Michael Hodge, Donna Dierker, and Tim Coalson
 ##
 ## ----------------------------------------------------------
 
@@ -13,22 +62,7 @@
 ### Set Defaults
 ### --------------------------------------------- ###
 
-SubjList="SubjID1 SubjID2 SubjID3"  # SPACE separated list of subject IDs
-
-# All 3 of the following folder locations can be specified with either an 
-# absolute path or a path *relative to this script*, without consequence.
-TemplatesFolder="/location/of/unpacked/StructuralQC/templates"
-StudyFolder="/location/of/subject/data/directories"
-
-# OutputSceneFolder: If left as the empty ("") string, the scene file for 
-# each subject (and a small number of other created files) 
-# will go into $StudyFolder/$Subject/MNINonLinear/StructuralQC.
-#    Obviously, that is only an option if you have write-permission into 
-#    the $StudyFolder tree!
-# Otherwise, it specifies the "common" directory where the scene files go
-# for all subjects
-OutputSceneFolder=""  # EMPTY string has special interpretation -- see above!
-#OutputSceneFolder="/location/of/common/output/directory/for/all/subjects"
+TemplatesFolder="$HCPPIPEDIR/PostFreeSurfer/scripts/QC_templates"
 
 # Some of the scenes display files in $TemplatesFolder (specifically, the MNI152 
 # volume template and group myelin maps from the S1200 release of HCP-YA).
@@ -37,160 +71,83 @@ OutputSceneFolder=""  # EMPTY string has special interpretation -- see above!
 # the relative path to the $TemplatesFolder, and uses that in creating the scene).
 # N.B. If you use 'TRUE', and $OutputSceneFolder is empty (""), then you'll be creating a
 # copy of the template files for each individual subject.
-CopyTemplates=FALSE
+#CopyTemplates=FALSE
 
 # If $CopyTemplates is TRUE, you may want to copy the files as symlinks rather than making copies of the files.
 # If $CopyTemplatesAs is set to "SYMLINKS", the templates will be copied as symlinks.
 # Otherwise if $CopyTemplatesAs is set to "FILES" or any other value, the templates will be copied as files.
-CopyTemplatesAs=FILES
+#CopyTemplatesAs=FILES
+
+#TSC: these are now controlled by the --copy-templates option
+#note that the templates folder is inside the pipelines scripts folder, so will often be a different filesystem/mountpoint than the data
+#thus, copy as files is the most bulletproof default, though it uses more disk space
+
+case "$TemplatesMethod" in
+    (no)
+        CopyTemplates=FALSE
+        CopyTemplatesAs=FILES
+        ;;
+    (links)
+        CopyTemplates=TRUE
+        CopyTemplatesAs=SYMLINKS
+        ;;
+    (files)
+        CopyTemplates=TRUE
+        CopyTemplatesAs=FILES
+        ;;
+    (*)
+        log_Err_Abort "unrecognized value '$TemplatesMethod' for --copy-templates"
+        ;;
+esac
+
+#sanity checks
+if ! [[ "$CopyTemplates" =~ ^(TRUE|FALSE)$ ]]; then
+    log_Err_Abort "internal error: Invalid value '$CopyTemplates' for CopyTemplates parameter"
+fi
+
+if ! [[ "$CopyTemplatesAs" =~ ^(SYMLINKS|FILES)$ ]]; then
+    log_Err_Abort "internal error: Invalid value '$CopyTemplatesAs' for CopyTemplatesAs parameter"
+fi
+
+verbose=$(opts_StringToBool "$verboseArg")
 
 ### --------------------------------------------- ###
 ### From here onward should not need any modification
 
-verbose=0
-
-scriptName=$(basename "${0}")
-
-Usage() {
-	printf "\n${scriptName} [options]\n\n"
-	printf "   Options\n\n"
-	printf "      -s, --subj-list             <space delimited subject list (quoted)>\n"
-	printf "      -t, --templates-folder      <path to templates folder>\n"
-	printf "      -f, --study-folder          <path to study folder>\n"
-	printf "      -o, --output-scene-folder   <path to output scene folder (optional)>\n"
-	printf "                                     Defaults to <StudyFolder>/<Subject>/MNINonLinear/StructuralQC\n"
-	printf "      -c, --copy-templates        [Create copy of templates files in output directory?]\n"
-	printf "      -a, --copy-templates-as     <FILES|SYMLINKS>\n"
-	printf "      -w, --wb-command-path       <path to wb_command (optional, if not available on path)>\n"
-	printf "      -v, --verbose               [Verbose Output Requested?]\n"
-	printf "\n\n"
-}
-
-if [ "$#" = "0" ]; then
-	Usage
-	exit 0
-fi
-
-while true; do 
-    case "$1" in
-      --help | -h | -\?)
-		  Usage
-		  exit 0
-		  ;;
-      --subj-list | -s)
-          SubjList=$2
-		  shift
-		  shift
-          ;;
-      --templates-folder | -t)
-          TemplatesFolder=$2
-		  shift
-		  shift
-          ;;
-      --study-folder | -f)
-          StudyFolder=$2
-		  shift 
-		  shift 
-          ;;
-      --output-scene-folder | -o)
-		  OutputSceneFolder=$2
-		  shift 
-		  shift 
-          ;;
-      --copy-templates | -c)
-		  CopyTemplates=TRUE
-		  shift 
-          ;;
-      --copy-templates-as | -a)
-		  CopyTemplatesAs=$2
-		  shift 
-		  shift 
-          ;;
-      --wb-command-path | -w)
-		  WbCommandPath=$2
-		  shift 
-		  shift 
-          ;;
-      --verbose | -v)
-		  verbose=1
-		  shift 
-          ;;
-      -*)
-		  echo "Invalid parameter ($1)"
-		  exit 1
-          ;;
-      *)
-		  break 
-          ;;
-    esac
-done
-
-if (( $verbose )) ; then
-	printf "Continue processing using the following values:\n\n"
-	echo "   SubjList=$SubjList"
-	echo "   TemplatesFolder=$TemplatesFolder"
-	echo "   StudyFolder=$StudyFolder"
-	echo "   OutputSceneFolder=$OutputSceneFolder"
-	echo "   CopyTemplates=$CopyTemplates"
-	echo "   CopyTemplatesAs=$CopyTemplatesAs"
-	echo "   WbCommandPath=$WbCommandPath"
-	echo "   verbose=$verbose"
-fi
-
-if [ ! -z "$WbCommandPath" ]; then
-	printf "\nSetting wb_command environment....."
-	if [ ! -f ${WbCommandPath}/wb_command ] ; then
-		printf "\nERROR:  Couldn't find wb_command executable in $WbCommandPath\n"
-	else
-		if [[ "$PATH" != *"$WbCommandPath"* ]] ; then
-			echo "UPDATING PATH!!!!"
-	        	PATH="${PATH}:${WbCommandPath}"
-		fi
-		printf "Done.\n\n"
-	fi
-fi
-
-export PATH
-
-which wb_command &> /dev/null || { echo "ERROR:  Couldn't find wb_command.  Exiting...." ; exit 1 ; }
+mkdir -p "$OutputSceneFolder"
 
 # Convert TemplatesFolder and StudyFolder to absolute paths (for convenience in reporting locations).
-# Do NOT do the same here with OutputSceneFolder, for which the empty string has special meaning!
-TemplatesFolder=$(cd $TemplatesFolder; pwd)
-StudyFolder=$(cd $StudyFolder; pwd)
+TemplatesFolder=$(cd "$TemplatesFolder"; pwd)
+StudyFolder=$(cd "$StudyFolder"; pwd)
+OutputSceneFolder=$(cd "$OutputSceneFolder"; pwd)
 
 # ----------------------------
 # Function to copy just the specific files in 'templates' that are needed
 # ----------------------------
 function copyTemplateFiles {
-	local templateDir=$1
-	local targetDir=$2
+    local templateDir=$1
+    local targetDir=$2
 
-	# Remove any pre-existing template files
-	rm -f $targetDir/S1200.{MyelinMap,sulc}* 
-	rm -f $targetDir/MNI152_T1_0.8mm.nii.gz
-	
-	if [ $CopyTemplatesAs != "SYMLINKS" ]; then
-		if (( $verbose )); then
-			echo "Copying template files to $targetDir as files"
-		fi
-		cp $templateDir/S1200.{MyelinMap,sulc}* $targetDir/.
-		cp $templateDir/MNI152_T1_0.8mm.nii.gz $targetDir/.
-	else
-		if (( $verbose )); then
-			echo "Copying template files to $targetDir as symlinks"
-		fi
-		for FIL in `find $templateDir -regextype posix-extended -regex  '^.*(MNI152|S1200.*(MyelinMap|sulc)).*$'`; do
-			FN=`basename $FIL`
-			ln -s $FIL $targetDir/$FN
-			RL=`readlink $targetDir/$FN`
-			RLC=`readlink -f $targetDir/$FN`
-			if [ "$RL" != "$RLC" ] ; then
-				echo "Converting relative template links to absolute link ($targetDir/$FN)"
-				ln -sf $RLC $targetDir/$FN 
-			fi
-		done
-	fi
+    # Remove any pre-existing template files
+    rm -f "$targetDir"/S1200.{MyelinMap,sulc}* 
+    rm -f "$targetDir"/MNI152_T1_0.8mm.nii.gz
+    
+    if [[ "$CopyTemplatesAs" != "SYMLINKS" ]]; then
+        if ((verbose)); then
+            echo "Copying template files to $targetDir as files"
+        fi
+        cp "$templateDir"/S1200.{MyelinMap,sulc}* "$targetDir"/.
+        cp "$templateDir"/MNI152_T1_0.8mm.nii.gz "$targetDir"/.
+    else
+        if ((verbose)); then
+            echo "Copying template files to $targetDir as symlinks"
+        fi
+        for FIL in $(find "$templateDir" -regextype posix-extended -regex  '^.*(MNI152|S1200.*(MyelinMap|sulc)).*$'); do
+            FN=$(basename "$FIL")
+            ln -s "$FIL" "$targetDir/$FN"
+            #TSC: all paths should always be absolute now, and readlink -f doesn't do the same thing on mac (and takes an extra argument)
+        done
+    fi
 }
 
 # ----------------------------
@@ -210,14 +167,11 @@ function copyTemplateFiles {
 # from https://stackoverflow.com/a/17110582
 
 function relativePath {
-  # both $1 and $2 are absolute paths beginning with /
-  # returns relative path from $1 to $2
-  local source=$(cd $1; pwd)
-  local target=$(cd $2; pwd)
-  local relPath=""
-
-  relPath=$(perl -e 'use File::Spec; print File::Spec->abs2rel(@ARGV) . "\n"' $target $source)
-  echo $relPath
+    # both $1 and $2 are absolute paths beginning with /
+    # returns relative path from $1 to $2
+    local source=$(cd "$1"; pwd)
+    local target=$(cd "$2"; pwd)
+    perl -e 'use File::Spec; print File::Spec->abs2rel(@ARGV) . "\n"' "$target" "$source"
 }
 
 # ----------------------------
@@ -230,179 +184,123 @@ SubjectIDDummyStr="SubjectID"
 TemplatesFolderDummyStr="TemplatesFolder"
 
 # ----------------------------
-# Parameter checks
-# ----------------------------
-
-if ! [[ "$CopyTemplates" =~ ^(TRUE|FALSE)$ ]]; then
-	echo "ERROR: Invalid entry for CopyTemplates parameter"
-	exit 1
-fi
-
-# ----------------------------
 # Begin main action of script
 # ----------------------------
 
 scriptDir=$(pwd)
 
-# If $OutputSceneFolder is not empty, then we are using a common $OutputSceneFolder for all subjects,
-# in which case it is more efficient to do the following operations once, rather than repeatedly
-# within the Subject loop
-if [ -n "$OutputSceneFolder" ]; then
-	OutputSceneFolderSubj=$OutputSceneFolder
-	mkdir -p $OutputSceneFolderSubj
-	relPathToStudy=$(relativePath $OutputSceneFolderSubj $StudyFolder)
-	if [ "$CopyTemplates" = "TRUE" ]; then
-		copyTemplateFiles $TemplatesFolder $OutputSceneFolderSubj
-		relPathToTemplates="."
-	else
-		relPathToTemplates=$(relativePath $OutputSceneFolderSubj $TemplatesFolder)
-	fi
-	if (( $verbose )); then
-		echo "TemplatesFolder: $TemplatesFolder"
-		echo "StudyFolder: $StudyFolder"
-		echo "OutputSceneFolder: $(cd $OutputSceneFolderSubj; pwd)"
-		echo "... relative path to template files (from OutputSceneFolder): $relPathToTemplates"
-		echo "... relative path to StudyFolder (from OutputSceneFolder): $relPathToStudy"
-	fi
+OutputSceneFolderSubj=$OutputSceneFolder
+mkdir -p $OutputSceneFolderSubj
+relPathToStudy=$(relativePath $OutputSceneFolderSubj $StudyFolder)
+if [ "$CopyTemplates" = "TRUE" ]; then
+   copyTemplateFiles $TemplatesFolder $OutputSceneFolderSubj
+   relPathToTemplates="."
+else
+   relPathToTemplates=$(relativePath $OutputSceneFolderSubj $TemplatesFolder)
+fi
+if ((verbose)); then
+   echo "TemplatesFolder: $TemplatesFolder"
+   echo "StudyFolder: $StudyFolder"
+   echo "OutputSceneFolder: $(cd $OutputSceneFolderSubj; pwd)"
+   echo "... relative path to template files (from OutputSceneFolder): $relPathToTemplates"
+   echo "... relative path to StudyFolder (from OutputSceneFolder): $relPathToStudy"
 fi
 
-# Loop over subjects
-for Subject in $SubjList; do
-	
-  echo "Subject: $Subject"
+# Define some convenience variables
+AtlasSpaceFolder="$StudyFolder/$Subject/MNINonLinear"
+mesh="164k_fs_LR"
 
-  # Define some convenience variables
-  AtlasSpaceFolder=$StudyFolder/$Subject/MNINonLinear
-  mesh="164k_fs_LR"
+if [[ -d "$AtlasSpaceFolder/xfms" ]]; then
+    if ((verbose)); then
+        echo "Subject folder appears to be okay."
+    fi
+else
+    log_Err_Abort "ERROR:  Subject folder missing expected directory MNINonLinear/xfms"
+fi
 
-  if (( $verbose )) ; then
-	printf "\nVerifying study folder...."
-  fi
-  if [ -d $AtlasSpaceFolder/xfms ] ; then
-	if (( $verbose )) ; then
-		printf "Done.\n"
-	fi
-  else 
-	printf "\nERROR:  Study folder missing expected directory ${AtlasSpaceFolder}/xfms\n"
-	exit 1
-  fi
+# Replace dummy strings in the template scenes to generate
+# a scene file appropriate for each subject
+SubjectSceneFile="$OutputSceneFolder/$Subject.structuralQC.wb_scene"
+sed -e "s|${StudyFolderDummyStr}|${relPathToStudy}|g" \
+    -e "s|${SubjectIDDummyStr}|${Subject}|g" \
+    -e "s|${TemplatesFolderDummyStr}|${relPathToTemplates}|g" \
+    "$TemplatesFolder"/TEMPLATE_structuralQC.scene > "$SubjectSceneFile"
 
-  # If $OutputSceneFolder is empty, then we use $AtlasSpaceFolder/StructuralQC
-  # as the output folder for each individual subject
-  if [ -z "$OutputSceneFolder" ]; then
-	OutputSceneFolderSubj=$AtlasSpaceFolder/StructuralQC
-	mkdir -p $OutputSceneFolderSubj
-	# Note: the TEMPLATE scene file is designed with "StudyFolder" as the "base" of its paths,
-	# so want to still compute the relative path to $StudyFolder (rather than say $StudyFolder/$Subject/MNINonLinear)
-	relPathToStudy=$(relativePath $OutputSceneFolderSubj $StudyFolder)
-	if [ "$CopyTemplates" = "TRUE" ]; then
-		copyTemplateFiles $TemplatesFolder $OutputSceneFolderSubj
-		relPathToTemplates="."
-	else
-		relPathToTemplates=$(relativePath $OutputSceneFolderSubj $TemplatesFolder)
-	fi
-	if (( $verbose )); then
-		echo "... TemplatesFolder: $TemplatesFolder"
-		echo "... StudyFolder: $StudyFolder"
-		echo "... OutputSceneFolder: $(cd $OutputSceneFolderSubj; pwd)"
-		echo "...... relative path to template files (from OutputSceneFolder): $relPathToTemplates"
-		echo "...... relative path to StudyFolder (from OutputSceneFolder): $relPathToStudy"
-	fi
-  fi
+# If StrainJ maps don't exist for the various registrations, 
+# but ArealDistortion maps do, use those instead
+for regName in FS MSMSulc MSMAll; do
+    if [[ ! -e "$AtlasSpaceFolder/$Subject.StrainJ_$regName.$mesh.dscalar.nii" && -e "$AtlasSpaceFolder/$Subject.ArealDistortion_$regName.$mesh.dscalar.nii" ]]; then
+        echo "... using ArealDistortion_${regName} map in place of StrainJ_${regName}"
+        # Following version of sed "in-place" replacement should work on both Linux and MacOS
+        sed -i.bak "s|StrainJ_${regName}|ArealDistortion_${regName}|g" "$SubjectSceneFile"
+        rm -f "$SubjectSceneFile.bak"
+    fi
+done
 
-  # Replace dummy strings in the template scenes to generate
-  # a scene file appropriate for each subject
-  SubjectSceneFile=$OutputSceneFolderSubj/"$Subject".structuralQC.wb.scene
-  sed -e "s|${StudyFolderDummyStr}|${relPathToStudy}|g" \
-	  -e "s|${SubjectIDDummyStr}|${Subject}|g" \
-	  -e "s|${TemplatesFolderDummyStr}|${relPathToTemplates}|g" \
-	  $TemplatesFolder/TEMPLATE_structuralQC.scene > $SubjectSceneFile
+## Map the T1w_acpc space volume into MNI152 space, using just the affine (linear) component
+## [Similar to the 'MNINonLinear/xfms/T1w_acpc_dc_restore_brain_to_MNILinear.nii.gz' volume
+## (created in AtlasRegistrationToMNI152_FLIRTandFNIRT.sh) 
+## except applied to the NON-brain-extracted volume].
+acpc2MNILinear="$AtlasSpaceFolder/xfms/acpc2MNILinear.mat"
+if [[ -e "$acpc2MNILinear" ]]; then
+    nativeVol=T1w_acpc_dc_restore
+    volumeIn="$AtlasSpaceFolder/../T1w/$nativeVol.nii.gz"
+    volumeRef="$AtlasSpaceFolder/T1w_restore.nii.gz"
+    volumeOut="$OutputSceneFolder/$Subject.${nativeVol}_to_MNILinear.nii.gz"
+    # Use -volume-affine-resample, rather than flirt, for resampling, to avoid adding need for FSL
+    wb_command -volume-affine-resample \
+        "$volumeIn" "$acpc2MNILinear" "$volumeRef" CUBIC "$volumeOut" \
+        -flirt "$volumeIn" "$volumeRef"
+fi
 
-  # If StrainJ maps don't exist for the various registrations, 
-  # but ArealDistortion maps do, use those instead
-  for regName in FS MSMSulc MSMAll; do
-	if [[ ! -e $AtlasSpaceFolder/$Subject.StrainJ_$regName.$mesh.dscalar.nii && -e $AtlasSpaceFolder/$Subject.ArealDistortion_$regName.$mesh.dscalar.nii ]]; then
-	  echo "... using ArealDistortion_${regName} map in place of StrainJ_${regName}"
-	  # Following version of sed "in-place" replacement should work on both Linux and MacOS
-	  sed -i.bak "s|StrainJ_${regName}|ArealDistortion_${regName}|g" $SubjectSceneFile
-	  rm $SubjectSceneFile.bak
-	fi
-  done
+## Create a surface-mapped version of the FNIRT volume distortion (for easy visualization).
+## We could use wb_command -volume-distortion on MNINonLinear/xfms/acpc_dc2standard.nii.gz, 
+## but its "isotropic" distortion (1st volume) is basically the same as the -jout (Jacobian) 
+## output of fnirt (highly correlated, but there is a small bias between the two, perhaps
+## because the fnirt jacobian doesn't include the affine component)?
+## So, since the fnirt jacobian is already part of the HCPpipelines output, we'll
+## use that for convenience
 
-  ## Map the T1w_acpc space volume into MNI152 space, using just the affine (linear) component
-  ## [Similar to the 'MNINonLinear/xfms/T1w_acpc_dc_restore_brain_to_MNILinear.nii.gz' volume
-  ## (created in AtlasRegistrationToMNI152_FLIRTandFNIRT.sh) 
-  ## except applied to the NON-brain-extracted volume].
-  acpc2MNILinear=$AtlasSpaceFolder/xfms/acpc2MNILinear.mat
-  if [ -e "$acpc2MNILinear" ]; then
-	  nativeVol=T1w_acpc_dc_restore
-	  volumeIn=$AtlasSpaceFolder/../T1w/$nativeVol.nii.gz
-	  volumeRef=$AtlasSpaceFolder/T1w_restore.nii.gz
-	  volumeOut=$OutputSceneFolderSubj/$Subject.${nativeVol}_to_MNILinear.nii.gz
-	  # Use -volume-affine-resample, rather than flirt, for resampling, to avoid adding need for FSL
-	  wb_command -volume-affine-resample \
-		   $volumeIn $acpc2MNILinear $volumeRef CUBIC $volumeOut \
-		   -flirt $volumeIn $volumeRef
-  fi
-  
-  ## Create a surface-mapped version of the FNIRT volume distortion (for easy visualization).
-  ## We could use wb_command -volume-distortion on MNINonLinear/xfms/acpc_dc2standard.nii.gz, 
-  ## but its "isotropic" distortion (1st volume) is basically the same as the -jout (Jacobian) 
-  ## output of fnirt (highly correlated, but there is a small bias between the two, perhaps
-  ## because the fnirt jacobian doesn't include the affine component)?
-  ## So, since the fnirt jacobian is already part of the HCPpipelines output, we'll
-  ## use that for convenience
+# Convert FNIRT's Jacobian to log base 2
+jacobian="$AtlasSpaceFolder/xfms/NonlinearRegJacobians.nii.gz"
+jacobianLog2="$OutputSceneFolder/$Subject.NonlinearRegJacobians_log2.nii.gz"
+wb_command -volume-math "ln(x)/ln(2)" "$jacobianLog2" -var x "$jacobian"
 
-  # Convert FNIRT's Jacobian to log base 2
-  jacobian=$AtlasSpaceFolder/xfms/NonlinearRegJacobians.nii.gz
-  jacobianLog2=$OutputSceneFolderSubj/$Subject.NonlinearRegJacobians_log2.nii.gz
-  wb_command -volume-math "ln(x)/ln(2)" $jacobianLog2 -var x $jacobian
+# Set palette properties
+#NOTE: thresholds are only being used on the volume file
+paletteArgs=(-pos-user 0 2 -neg-user 0 -2 -palette-name "ROY-BIG-BL"
+             -interpolate true -disp-pos true -disp-neg true -disp-zero false)
+thresholdArgs=(-thresholding THRESHOLD_TYPE_NORMAL THRESHOLD_TEST_SHOW_OUTSIDE -1 1)
+wb_command -volume-palette "$jacobianLog2" MODE_USER_SCALE \
+    "${paletteArgs[@]}" \
+    "${thresholdArgs[@]}"
 
-  # Set palette properties
-  posMinMax="0 2"
-  negMinMax="0 -2"
-  paletteName="ROY-BIG-BL"
-  thresholds="-1 1"
-  wb_command -volume-palette $jacobianLog2 MODE_USER_SCALE \
-	  -pos-user $posMinMax -neg-user $negMinMax -interpolate true -palette-name $paletteName \
-	  -disp-pos true -disp-neg true -disp-zero false \
-	  -thresholding THRESHOLD_TYPE_NORMAL THRESHOLD_TEST_SHOW_OUTSIDE $thresholds
+# Map to surface
+mapName=NonlinearRegJacobians_FNIRT
+for hemi in L R; do 
+    surf=$AtlasSpaceFolder/$Subject.$hemi.midthickness.$mesh.surf.gii
+    # Warpfields are smooth enough that trilinear interpolation is fine in -volume-to-surface-mapping
+    wb_command -volume-to-surface-mapping $jacobianLog2 "$surf" \
+        "$OutputSceneFolder/$Subject.$mapName.$hemi.$mesh.func.gii" -trilinear
+done
 
-  # Map to surface
-  mapName=NonlinearRegJacobians_FNIRT
-  for hemi in L R; do 
-	  surf=$AtlasSpaceFolder/$Subject.$hemi.midthickness.$mesh.surf.gii
-	  # Warpfields are smooth enough that trilinear interpolation is fine in -volume-to-surface-mapping
-	  wb_command -volume-to-surface-mapping $jacobianLog2 $surf \
-		  $OutputSceneFolderSubj/$Subject.$mapName.$hemi.$mesh.func.gii -trilinear
-  done
+# Convert to dscalar and set palette properties
+wb_command -cifti-create-dense-scalar "$OutputSceneFolder/$Subject.$mapName.$mesh.dscalar.nii" \
+  -left-metric "$OutputSceneFolder/$Subject.$mapName.L.$mesh.func.gii" \
+  -right-metric "$OutputSceneFolder/$Subject.$mapName.R.$mesh.func.gii"
+wb_command -set-map-names "$OutputSceneFolder/$Subject.$mapName.$mesh.dscalar.nii" -map 1 "${Subject}_$mapName"
+wb_command -cifti-palette "$OutputSceneFolder/$Subject.$mapName.$mesh.dscalar.nii" MODE_USER_SCALE \
+  "$OutputSceneFolder/$Subject.$mapName.$mesh.dscalar.nii" \
+  "${paletteArgs[@]}"
 
-  # Convert to dscalar and set palette properties
-  # For convenience, switch into $OutputSceneFolderSubj for final operations
-  cd $OutputSceneFolderSubj
-  wb_command -cifti-create-dense-scalar $Subject.$mapName.$mesh.dscalar.nii \
-	  -left-metric $Subject.$mapName.L.$mesh.func.gii \
-	  -right-metric $Subject.$mapName.R.$mesh.func.gii
-  wb_command -set-map-names $Subject.$mapName.$mesh.dscalar.nii -map 1 ${Subject}_$mapName
-  wb_command -cifti-palette $Subject.$mapName.$mesh.dscalar.nii MODE_USER_SCALE \
-	  $Subject.$mapName.$mesh.dscalar.nii \
-	  -pos-user $posMinMax -neg-user $negMinMax -interpolate true -palette-name $paletteName \
-	  -disp-pos true -disp-neg true -disp-zero false
+pngDir="$OutputSceneFolder/snapshots"
+mkdir -p "${pngDir}"
+sceneFile="${Subject}.structuralQC.wb_scene"
+numScenes=$(grep "SceneInfo Index" "$OutputSceneFolder/$sceneFile" | wc -l)
+for ((ind = 1; ind <= numScenes; ind++)); do
+    wb_command -show-scene "$OutputSceneFolder/$sceneFile" $ind "${pngDir}/${sceneFile}${ind}.png" 100 100 -use-window-size
+done
 
-  # Generate png snapshots of the scenes
-  pushd $OutputSceneFolderSubj &> /dev/null
-  pngDir=snapshots
-  mkdir -p ${pngDir}
-  sceneFile=${Subject}.structuralQC.wb.scene
-  numScenes=$(grep "SceneInfo Index" $sceneFile | wc -l)
-  for (( ind=1; ind<=$numScenes; ind++ )); do
-  	wb_command -show-scene $sceneFile $ind ${pngDir}/${sceneFile}${ind}.png 100 100 -use-window-size
-  done
-  popd &> /dev/null
+# Cleanup
+rm "$OutputSceneFolder/$Subject.$mapName."{L,R}".$mesh.func.gii"
 
-  # Cleanup
-  rm $Subject.$mapName.{L,R}.$mesh.func.gii
-
-  cd $scriptDir
-
-done  # Subject loop
